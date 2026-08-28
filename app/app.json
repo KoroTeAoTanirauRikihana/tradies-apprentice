@@ -1,0 +1,26 @@
+{
+  "expo": {
+    "name": "The Tradie's Apprentice",
+    "slug": "tradies-apprentice-build",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "package": "org.koroai.tradiesapprentice",
+      "adaptiveIcon": {
+        "backgroundColor": "#2a2116",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "versionCode": 1
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    }
+  }
+}
