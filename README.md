@@ -2,8 +2,8 @@
 
 Free, public knowledge-consultation app for home electrical and plumbing
 trades, tools, and real DIY conversion knowledge (EVs, boats, aircraft,
-phones, maglev demos) - a companion to The Tohunga's Apprentice (Māori
-tradition) and The Seer's Apprentice (Norse/Celtic tradition). Standalone
+phones, maglev demos) - a companion to New Zealand - The Tohunga's Apprentice (Māori
+tradition) and United Kingdom - The Seer's Apprentice (Norse/Celtic tradition). Standalone
 from Koro Global Hub for the same reason as the other two: the Hub holds
 private tasks/family info/other workers that should never face the
 public internet.

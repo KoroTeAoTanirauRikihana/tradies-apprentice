@@ -1,0 +1,148 @@
+"""Copies the current Tradie's Apprentice knowledge base out of its own
+dedicated vault (Electrician_Apprentice_Vault) into this standalone
+project's own knowledge/ folder, so the public app's backend never has a
+live path dependency into Koro's own machine. Same pattern as the Seer's
+Apprentice and Tohunga's Apprentice public apps.
+
+Real filtering, not a blind copy - drops paragraphs tagged "Gap - flagged"
+or "Lower confidence", same honesty-tier vocabulary used consistently
+across every knowledge document in this project.
+"""
+from __future__ import annotations
+
+import re
+import shutil as _shutil
+import threading as _threading
+import time as _time
+from pathlib import Path
+
+SOURCE = (
+    Path.home()
+    / "Documents"
+    / "Electrician_Apprentice_Vault"
+    / "Knowledge"
+)
+DEST = Path(__file__).resolve().parent / "knowledge"
+
+_UNVERIFIED_MARKERS = (
+    re.compile(r"gap\s*[-—]\s*flagged", re.IGNORECASE),
+    re.compile(r"lower confidence", re.IGNORECASE),
+)
+
+
+def _is_verified_paragraph(paragraph: str) -> bool:
+    return not any(marker.search(paragraph) for marker in _UNVERIFIED_MARKERS)
+
+
+def _filter_verified(text: str) -> str:
+    paragraphs = re.split(r"\n\s*\n", text)
+    kept = [p for p in paragraphs if _is_verified_paragraph(p)]
+    return "\n\n".join(kept)
+
+
+def _sync_into_dest() -> dict:
+    if not SOURCE.is_dir():
+        raise FileNotFoundError(f"Source knowledge folder not found: {SOURCE}")
+    DEST.mkdir(parents=True, exist_ok=True)
+    for old in DEST.glob("**/*.md"):
+        old.unlink()
+
+    synced_files = 0
+    dropped_paragraphs = 0
+    for path in sorted(SOURCE.glob("**/*.md")):
+        original = path.read_text(encoding="utf-8")
+        filtered = _filter_verified(original)
+        dropped_paragraphs += len(re.split(r"\n\s*\n", original)) - len(
+            re.split(r"\n\s*\n", filtered)
+        )
+        relative = path.relative_to(SOURCE)
+        dest_path = DEST / relative
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        dest_path.write_text(filtered, encoding="utf-8")
+        synced_files += 1
+
+    return {"synced_files": synced_files, "dropped_paragraphs": dropped_paragraphs}
+
+
+_SYNC_LOCK = _threading.Lock()
+
+
+def _swap_in(staging: Path, retired: Path, attempts: int = 10) -> None:
+    """Move staging into place as DEST, retrying briefly.
+
+    A directory rename on Windows fails while another thread holds a file
+    inside it open. Reads here are short, so a few retries clear it; if it
+    genuinely cannot swap, the existing knowledge folder is left untouched
+    and working rather than half-replaced.
+    """
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            if DEST.exists():
+                DEST.rename(retired)
+            staging.rename(DEST)
+            return
+        except OSError as exc:
+            last_error = exc
+            if retired.exists() and not DEST.exists():
+                retired.rename(DEST)  # put the working copy straight back
+            _time.sleep(0.1 * (attempt + 1))
+    _shutil.rmtree(staging, ignore_errors=True)
+    raise RuntimeError(f"Could not swap the new knowledge folder into place: {last_error}")
+
+
+def sync() -> dict:
+    """Rebuild the local knowledge folder from the vault, atomically.
+
+    Real bug this fixes, found 2026-09-09: the sync used to unlink every
+    knowledge/*.md in place and write the new ones one at a time, while
+    the running app read that same folder. A question arriving inside that
+    window saw a half-built knowledge base - once measured at 81 of 144
+    sections - and nothing said so. A reader now sees the old folder, or
+    the new one, never a partial one.
+
+    The original body is untouched below as _sync_into_dest(); it writes
+    to the module-level DEST, which is pointed at a staging folder here.
+    """
+    with _SYNC_LOCK:
+        return _sync_locked()
+
+
+def _sync_locked() -> dict:
+    global DEST
+    real_dest = DEST
+    staging = real_dest.parent / (real_dest.name + ".new")
+    retired = real_dest.parent / (real_dest.name + ".old")
+    for leftover in (staging, retired):
+        if leftover.exists():
+            _shutil.rmtree(leftover, ignore_errors=True)
+
+    DEST = staging
+    try:
+        result = _sync_into_dest()
+    except BaseException:
+        DEST = real_dest
+        _shutil.rmtree(staging, ignore_errors=True)
+        raise
+    DEST = real_dest
+
+    if not result.get("synced_files"):
+        # Never swap an empty knowledge base in over a working one.
+        _shutil.rmtree(staging, ignore_errors=True)
+        raise RuntimeError("Refusing to sync: no knowledge files found in the source vault")
+
+    _swap_in(staging, retired)
+    _shutil.rmtree(retired, ignore_errors=True)
+    return result
+
+
+def main() -> None:
+    result = sync()
+    print(
+        f"Synced {result['synced_files']} knowledge file(s) from {SOURCE} to {DEST} "
+        f"(dropped {result['dropped_paragraphs']} unverified paragraph(s))."
+    )
+
+
+if __name__ == "__main__":
+    main()

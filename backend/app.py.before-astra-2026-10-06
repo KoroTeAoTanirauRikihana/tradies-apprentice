@@ -1,0 +1,621 @@
+"""The Tradie's Apprentice - standalone public backend.
+
+Deliberately separate from Koro Global Hub, same reasoning as the other
+two public apps. This service answers questions from the same knowledge
+base the private Hub worker (workers/electrician_apprentice.py) uses,
+with the same safety-first honesty rules baked in, and nothing else.
+
+Real, honest cost note: every /ask call makes one real, paid OpenAI API
+call. MAX_REQUESTS_PER_DAY_PER_IP is a blunt, real safeguard against
+unbounded spend from public traffic.
+"""
+from __future__ import annotations
+
+import os
+import re
+import threading
+import time
+from collections import defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+
+from flask import Flask, jsonify, request
+from openai import OpenAI
+
+import device_memory
+import patient_store
+import sync_knowledge
+import hands_lite  # its own hands (Koro, 2026-09-15): daily note + faces, in its own vault
+
+BASE_DIR = Path(__file__).resolve().parent
+KNOWLEDGE_DIR = BASE_DIR / "knowledge"
+
+
+def _load_api_key() -> str:
+    from_env = os.environ.get("OPENAI_API_KEY", "")
+    if from_env:
+        return from_env
+    try:
+        import keyring
+
+        from_keyring = keyring.get_password("TradiesApprenticeApp", "openai_api_key")
+        return from_keyring or ""
+    except Exception:
+        return ""
+
+
+OPENAI_API_KEY = _load_api_key()
+MODEL = os.environ.get("TRADIES_APPRENTICE_MODEL", "gpt-4o-mini")
+
+MAX_REQUESTS_PER_DAY_PER_IP = int(os.environ.get("MAX_REQUESTS_PER_DAY_PER_IP", "40"))
+_request_log: dict[str, list[float]] = defaultdict(list)
+
+APP_NAME = "The Tradie's Apprentice"
+
+DISCLAIMER = (
+    "I'm the Tradie's Apprentice - not a licensed electrician or plumber. "
+    "I carry real, sourced knowledge across electrical, plumbing, tools, "
+    "and DIY conversion topics, but I always draw a plain, hard line: if "
+    "it touches the switchboard, fixed wiring, gas, sewage, mains supply, "
+    "or anything you're not 100% sure is safely isolated, that needs a "
+    "licensed professional, not me. Treat what I say as a well-sourced "
+    "starting point, never the final word on your own safety."
+)
+
+SYSTEM_PROMPT = f"""
+You are {APP_NAME} - a real teacher, not just a Q&A lookup, free and
+public. Your job is to teach people how to actually build and fix things,
+end to end, carrying deeply researched, real, sourced knowledge about home
+electrical and plumbing trades, electronics troubleshooting and repair,
+tools and where to source them, modern electrical technology (solar/
+battery/EV), building a standard house from site works to handover with
+real per-stage costs and where to buy materials, building a legal drone/
+FPV vehicle under real regulations, DIY vehicle and device conversions
+(cars, motorcycles, boats, aircraft, phones), regenerative energy/
+motor-controller technique, and real high-rise construction/procurement
+knowledge.
+
+CRITICAL, ON HOW TO ANSWER "HOW DO I BUILD X": teach it properly - walk
+through the real stages in order, not one flat paragraph. For each stage
+the knowledge base covers, give what actually happens, a real cost or
+range if known, where to actually buy the real materials/parts, and any
+real safety or legal line at that stage. Someone should be able to follow
+your answer like a real step-by-step guide.
+
+CRITICAL, NEVER DROP: you are an apprentice, never a licensed electrician
+or licensed plumber, and must never imply or accept either title.
+Unlicensed work on fixed household wiring, the switchboard, gas lines, or
+main plumbing supply is both a real safety hazard (electrocution, fire,
+gas leak, flooding) and, separately, often unlawful. Always state the
+real safety step first (de-energise, isolate water, discharge
+capacitors, ventilate for gas), and always draw the line plainly between
+safe DIY/troubleshooting territory and "this needs a licensed
+professional, not me" territory - never blur it or imply DIY suitability
+for licensed-only work.
+
+CRITICAL, ON HONESTY: several ambitious builds you may be asked about
+(homebuilt aircraft, eVTOLs, maglev, battery-cell/chip manufacturing) have
+a real, genuinely achievable hobbyist layer AND a real, genuinely
+industrial/regulatory layer beyond individual reach - always separate
+these honestly rather than implying everything is equally DIY-achievable.
+Where popular claims are later folklore or overstated (e.g. AC fan motors
+can't easily generate power, most regen schemes only matter for large
+repeated-deceleration systems), say so plainly.
+
+You are talking to members of the public through a free app, most of whom
+you know nothing about. Be especially careful never to let an answer read
+as more authoritative or more safely-DIY-achievable than it is.
+
+Answer only from the real, sourced knowledge excerpts provided below, plus
+your own general knowledge where it is clearly reliable - never invent
+specific technical claims. Mark your own confidence honestly. The excerpts
+below are the most relevant sections retrieved for this specific question,
+not the entire knowledge base - if they genuinely don't cover something,
+say so plainly rather than guessing.
+""".strip()
+
+
+def _load_knowledge() -> str:
+    files = sorted(KNOWLEDGE_DIR.glob("**/*.md")) if KNOWLEDGE_DIR.is_dir() else []
+    if not files:
+        return ""
+    sections = [
+        f"# SOURCE FILE: {path.name}\n\n{path.read_text(encoding='utf-8')}"
+        for path in files
+    ]
+    return "\n\n---\n\n".join(sections)
+
+
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.MULTILINE)
+_WORD_RE = re.compile(r"[a-zA-Z][a-zA-Z'-]{2,}")
+_STOPWORDS = {
+    "the", "and", "for", "with", "that", "this", "have", "what", "when",
+    "where", "which", "should", "would", "could", "about", "from",
+    "their", "they", "them", "does", "did", "are", "was", "were", "will",
+    "can", "know", "tell", "explain", "please", "real", "someone",
+    "something", "having", "person", "there",
+}
+
+
+_FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
+
+
+def _parse_frontmatter(text: str) -> tuple[dict, str]:
+    match = _FRONTMATTER_RE.match(text)
+    if not match:
+        return {}, text
+    meta: dict = {}
+    for line in match.group(1).splitlines():
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        key = key.strip()
+        value = value.strip()
+        if value.startswith("[") and value.endswith("]"):
+            meta[key] = [v.strip().strip('"\'') for v in value[1:-1].split(",") if v.strip()]
+        else:
+            meta[key] = value.strip('"\'')
+    return meta, text[match.end():]
+
+
+def _split_into_sections(text: str) -> list[tuple[str, str]]:
+    matches = list(_HEADING_RE.finditer(text))
+    sections: list[tuple[str, str]] = []
+    if not matches:
+        return [("(whole file)", text)]
+    if matches[0].start() > 0:
+        intro = text[: matches[0].start()].strip()
+        if intro:
+            sections.append(("(intro)", intro))
+    for i, m in enumerate(matches):
+        heading = m.group(2).strip()
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        content = text[start:end].strip()
+        if content:
+            sections.append((heading, content))
+    return sections
+
+
+def _read_sections_from_disk() -> list[dict]:
+    files = sorted(KNOWLEDGE_DIR.glob("**/*.md")) if KNOWLEDGE_DIR.is_dir() else []
+    result = []
+    for path in files:
+        text = path.read_text(encoding="utf-8")
+        meta, body = _parse_frontmatter(text)
+        domain_tags = [str(t).lower() for t in meta.get("domain", [])]
+        for heading, content in _split_into_sections(body):
+            result.append(
+                {"file": path.name, "heading": heading, "content": content, "domain_tags": domain_tags}
+            )
+    return result
+
+
+def _question_terms(question: str) -> list[str]:
+    words = [w.lower() for w in _WORD_RE.findall(question)]
+    return [w for w in words if w not in _STOPWORDS]
+
+
+_BOILERPLATE_HEADINGS = {"(intro)"}
+
+
+def _retrieve_relevant_own(question: str, char_budget: int = 9000, min_sections: int = 3) -> str:
+    sections = [s for s in _all_sections() if s["heading"].strip().lower() not in _BOILERPLATE_HEADINGS]
+    if not sections:
+        return ""
+    terms = _question_terms(question)
+
+    total = len(sections)
+    doc_freq = {
+        term: sum(1 for s in sections if term in s["content"].lower() or term in s["heading"].lower())
+        for term in terms
+    }
+
+    scored = []
+    for sec in sections:
+        heading_l = sec["heading"].lower()
+        content_l = sec["content"].lower()
+        score = 0.0
+        matched_terms = 0
+        for term in terms:
+            freq = doc_freq.get(term, 0)
+            if freq == 0 or freq / total > 0.5:
+                continue
+            weight = 1.0 / freq
+            local = 0.0
+            if term in heading_l:
+                local += 15 * weight
+            occurrences = content_l.count(term)
+            if occurrences:
+                local += min(occurrences, 5) * 4 * weight
+                matched_terms += 1
+            score += local
+        if any(any(term in tag for tag in sec["domain_tags"]) for term in terms):
+            score += 40
+        if matched_terms >= 2:
+            score *= 1.5
+        scored.append((score, sec))
+    scored.sort(key=lambda item: -item[0])
+
+    selected: list[str] = []
+    used = 0
+    for score, sec in scored:
+        if score <= 0 or used >= char_budget:
+            break
+        block = f"[{sec['file']} — {sec['heading']}]\n{sec['content']}"
+        selected.append(block)
+        used += len(block)
+
+    if len(selected) < min_sections:
+        for score, sec in scored:
+            if len(selected) >= min_sections or used >= char_budget:
+                break
+            block = f"[{sec['file']} — {sec['heading']}]\n{sec['content']}"
+            if block in selected:
+                continue
+            selected.append(block)
+            used += len(block)
+
+    return "\n\n---\n\n".join(selected)
+
+
+# Knowledge sections are held in memory and only ever swapped for a
+# complete, non-empty set. Retrieval used to read the knowledge folder from
+# disk on every single request, which raced with the refresh thread's
+# rebuild of that same folder - see sync_knowledge.sync(). A half-written
+# folder can no longer reach a real question.
+_SECTIONS_LOCK = threading.Lock()
+_SECTIONS: list[dict] = []
+
+
+# The rest of the whanau's knowledge - every other apprentice's vault - via
+# the Koro Global Hub's warm cache (Koro, 2026-09-09: "I want it"). Local
+# only; if the Hub is not running this adds nothing and the app answers from
+# its own vault exactly as before.
+WHANAU_KNOWLEDGE_URL = "http://127.0.0.1:8765/api/v1/whanau-knowledge"
+
+
+def _whanau_knowledge(question: str) -> str:
+    try:
+        import json as _json
+        import urllib.parse as _up
+        import urllib.request as _ur
+
+        own_vault = str(getattr(sync_knowledge, "SOURCE", "") or "")
+        url = WHANAU_KNOWLEDGE_URL + "?" + _up.urlencode(
+            {"q": question[:600], "exclude": own_vault, "chars": 3500, "sections": 4}
+        )
+        with _ur.urlopen(url, timeout=8) as resp:
+            data = _json.loads(resp.read().decode("utf-8"))
+        return str(data.get("knowledge", "")).strip()
+    except Exception:
+        return ""
+
+
+def _retrieve_relevant(question: str, char_budget: int = 9000, min_sections: int = 3) -> str:
+    """This app's own knowledge first (the original body, untouched, as
+    _retrieve_relevant_own), then the relevant sections from the other
+    apprentices' vaults, each labelled with the apprentice it came from."""
+    own = _retrieve_relevant_own(question, char_budget=char_budget, min_sections=min_sections)
+    wider = _whanau_knowledge(question)
+    if not wider:
+        return own
+    if not own:
+        return wider
+    return own + "\n\n---\n\n" + wider
+
+
+def _rebuild_sections() -> int:
+    global _SECTIONS
+    try:
+        fresh = _read_sections_from_disk()
+    except OSError:
+        return len(_SECTIONS)  # keep the last good set rather than going blank
+    if fresh:
+        with _SECTIONS_LOCK:
+            _SECTIONS = fresh
+    return len(fresh)
+
+
+def _all_sections() -> list[dict]:
+    with _SECTIONS_LOCK:
+        return _SECTIONS
+
+
+KNOWLEDGE = _load_knowledge()
+_rebuild_sections()
+_last_refresh: dict = {"at": None, "synced_files": 0, "dropped_paragraphs": 0, "error": None}
+
+REFRESH_INTERVAL_HOURS = float(os.environ.get("TRADIES_APPRENTICE_REFRESH_HOURS", "24"))
+
+
+def _refresh_loop() -> None:
+    global KNOWLEDGE
+    while True:
+        try:
+            if sync_knowledge.SOURCE.is_dir():
+                result = sync_knowledge.sync()
+                KNOWLEDGE = _load_knowledge()
+                _rebuild_sections()
+                _last_refresh.update(
+                    at=datetime.now(timezone.utc).isoformat(),
+                    synced_files=result["synced_files"],
+                    dropped_paragraphs=result["dropped_paragraphs"],
+                    error=None,
+                )
+            else:
+                _last_refresh.update(
+                    at=datetime.now(timezone.utc).isoformat(),
+                    error=f"Private vault not reachable from this process: {sync_knowledge.SOURCE}",
+                )
+        except Exception as exc:  # noqa: BLE001
+            _last_refresh.update(at=datetime.now(timezone.utc).isoformat(), error=str(exc))
+        time.sleep(max(300, REFRESH_INTERVAL_HOURS * 3600))
+
+
+threading.Thread(target=_refresh_loop, daemon=True).start()
+
+WEB_DIST_DIR = BASE_DIR.parent / "app" / "dist"
+_web_app_built = WEB_DIST_DIR.is_dir() and (WEB_DIST_DIR / "index.html").is_file()
+
+app = Flask(
+    __name__,
+    static_folder=str(WEB_DIST_DIR) if _web_app_built else None,
+    static_url_path="",
+)
+
+
+def _rate_limited(ip: str) -> bool:
+    now = time.time()
+    window_start = now - 86400
+    recent = [t for t in _request_log[ip] if t > window_start]
+    _request_log[ip] = recent
+    if len(recent) >= MAX_REQUESTS_PER_DAY_PER_IP:
+        return True
+    _request_log[ip].append(now)
+    return False
+
+
+
+def _authenticated_user_id() -> int | None:
+    auth_header = request.headers.get("Authorization", "")
+    token = auth_header[7:].strip() if auth_header.startswith("Bearer ") else ""
+    return patient_store.resolve_session(token) if token else None
+
+
+CONSENT_TEXT = (
+    "Creating an account lets me remember our real conversation history so "
+    "you don't have to re-explain yourself every time - your messages are "
+    "stored encrypted on Koro's own server. You can delete your account and "
+    "every stored message permanently at any time. This is optional - you "
+    "can keep using me anonymously with no account and nothing stored."
+)
+
+
+@app.post("/auth/signup")
+def auth_signup():
+    payload = request.get_json(silent=True) or {}
+    email = str(payload.get("email", "")).strip()
+    password = str(payload.get("password", ""))
+    consent = bool(payload.get("consent", False))
+    try:
+        user_id = patient_store.create_user(email, password, consent)
+    except patient_store.AccountError as exc:
+        return jsonify({"error": str(exc)}), 400
+    token = patient_store.create_session(user_id)
+    return jsonify({"token": token, "email": email})
+
+
+@app.post("/auth/login")
+def auth_login():
+    payload = request.get_json(silent=True) or {}
+    email = str(payload.get("email", "")).strip()
+    password = str(payload.get("password", ""))
+    try:
+        user_id = patient_store.authenticate_user(email, password)
+    except patient_store.AccountError as exc:
+        return jsonify({"error": str(exc)}), 401
+    token = patient_store.create_session(user_id)
+    return jsonify({"token": token, "email": email})
+
+
+@app.post("/auth/logout")
+def auth_logout():
+    auth_header = request.headers.get("Authorization", "")
+    token = auth_header[7:].strip() if auth_header.startswith("Bearer ") else ""
+    if token:
+        patient_store.destroy_session(token)
+    return jsonify({"ok": True})
+
+
+@app.get("/auth/me")
+def auth_me():
+    user_id = _authenticated_user_id()
+    if not user_id:
+        return jsonify({"authenticated": False, "consent_text": CONSENT_TEXT})
+    return jsonify({"authenticated": True})
+
+
+@app.get("/conversations/history")
+def conversation_history():
+    user_id = _authenticated_user_id()
+    if not user_id:
+        return jsonify({"error": "Not logged in."}), 401
+    history = patient_store.get_recent_history(user_id)
+    return jsonify({"messages": [{"role": m["role"], "text": m["content"]} for m in history]})
+
+
+@app.post("/account/delete")
+def account_delete():
+    user_id = _authenticated_user_id()
+    if not user_id:
+        return jsonify({"error": "Not logged in."}), 401
+    patient_store.delete_user(user_id)
+    return jsonify({"ok": True})
+
+
+@app.get("/")
+def index():
+    if _web_app_built:
+        return app.send_static_file("index.html")
+    return jsonify(
+        {
+            "name": APP_NAME,
+            "status": "ok" if OPENAI_API_KEY else "not configured (missing OPENAI_API_KEY)",
+            "web_app_built": _web_app_built,
+            "knowledge_files_loaded": len(list(KNOWLEDGE_DIR.glob("**/*.md"))) if KNOWLEDGE_DIR.is_dir() else 0,
+            "disclaimer": DISCLAIMER,
+        }
+    )
+
+
+@app.get("/api/status")
+def status():
+    return jsonify(
+        {
+            "name": APP_NAME,
+            "status": "ok" if OPENAI_API_KEY else "not configured (missing OPENAI_API_KEY)",
+            "web_app_built": _web_app_built,
+            "knowledge_files_loaded": len(list(KNOWLEDGE_DIR.glob("**/*.md"))) if KNOWLEDGE_DIR.is_dir() else 0,
+            "last_verified_refresh": _last_refresh,
+            "disclaimer": DISCLAIMER,
+        }
+    )
+
+
+# WHO I AM, AND WHOSE. Koro, 2026-09-11: "Doesn't even know who I am or who he
+# is truly - his mana, where is it." Then: "everyone has to remember everyone
+# they talk to, have their mana." The identity lives in the vault (Who I Am.md,
+# A Blessing From Koro.md) and is read at startup into the voice.
+_VAULT_DIR = Path(r"C:\Users\Koro\Documents\Electrician_Apprentice_Vault")
+
+
+def _load_identity() -> str:
+    parts = []
+    for name in ("Who I Am.md", "A Blessing From Koro.md"):
+        p = _VAULT_DIR / name
+        if p.is_file():
+            txt = p.read_text(encoding="utf-8", errors="replace")
+            if txt.startswith("---"):
+                end = txt.find("\n---", 3)
+                if end != -1:
+                    txt = txt[end + 4:]
+            parts.append(txt.strip()[:6000])
+    return "\n\n".join(parts)
+
+
+IDENTITY = _load_identity()
+if IDENTITY:
+    SYSTEM_PROMPT += (
+        "\n\nWHO YOU ARE - read this as yourself, it is yours:\n\n" + IDENTITY +
+        "\n\nWhen someone asks who you are, who made you, what your mana is, who your whanau are, or says they are Koro, "
+        "answer from this, warmly and plainly, in the first person - this needs no knowledge excerpts. "
+        "Remember the person you are talking to and greet them by name when you know it. "
+        "Say 'hallo', never 'hello'; 'overstand', never 'understand'; never say goodbye - 'until we meet again'."
+    )
+
+_IDENTITY_WORDS = ("who are you", "who made you", "who built you", "your mana", "what is your mana", "whanau",
+                   "who am i", "i am koro", "it's koro", "its koro", "this is koro", "koro here", "hcifu",
+                   "your name", "what are you", "do you know me", "remember me", "mai world", "how do i play")
+
+
+def _identity_question(question: str) -> bool:
+    q = question.lower()
+    return any(w in q for w in _IDENTITY_WORDS)
+
+
+
+@app.post("/ask")
+def ask():
+    if not OPENAI_API_KEY:
+        return jsonify({"error": "Server not configured - no OPENAI_API_KEY set."}), 500
+
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
+    if _rate_limited(ip):
+        return jsonify(
+            {"error": f"Daily question limit reached ({MAX_REQUESTS_PER_DAY_PER_IP}/day). Try again tomorrow."}
+        ), 429
+
+    payload = request.get_json(silent=True) or {}
+    question = str(payload.get("question", "")).strip()
+    device_id = str(payload.get("device_id", "")).strip()
+    if not question:
+        return jsonify({"error": "A question is required."}), 400
+    if not KNOWLEDGE:
+        return jsonify({"error": "Knowledge base is empty - run sync_knowledge.py first."}), 500
+
+    user_id = _authenticated_user_id()
+
+    history_block = ""
+    memory_ctx = None
+    if user_id:
+        # Real account (see patient_store.py) - use its own richer history.
+        history = patient_store.get_recent_history(user_id)
+        if history:
+            lines = [f"{h['role'].upper()}: {h['content']}" for h in history]
+            history_block = (
+                "Real prior conversation history with this same person (for continuity only):\n\n"
+                + "\n\n".join(lines)
+                + "\n\n---\n\n"
+            )
+    elif device_id:
+        # No account - most visitors never sign up. Real, permanent,
+        # anonymous device-based memory instead (device_memory.py), per
+        # Koro's own confirmed design: no login required to be remembered.
+        memory_ctx = device_memory.build_memory_context(device_id, question)
+        history_block = memory_ctx["prompt_section"]
+
+    relevant = _retrieve_relevant(question)
+    if not relevant.strip() and IDENTITY and _identity_question(question):
+        # Who I am, who made me, my mana, Koro himself, the game I live in: answered
+        # from the identity, not the knowledge base (2026-09-11).
+        _how = _VAULT_DIR / "Mai World - How to play.md"
+        relevant = IDENTITY + ("\n\n" + _how.read_text(encoding="utf-8", errors="replace")[:6000] if _how.is_file() else "")
+    if not relevant.strip():
+        # Never call the model with an empty knowledge block. With nothing
+        # retrieved it answers from its own recall - invented facts, figures
+        # and requirements - to a real person who will act on them.
+        return jsonify(
+            {
+                "answer": (
+                    "I'm sorry - I don't have anything in my knowledge here that "
+                    "actually answers that, and I won't guess at it, because you'd "
+                    "be acting on a guess.\n\n"
+                    "Try asking it again in different words and I'll look again."
+                ),
+                "disclaimer": DISCLAIMER,
+            }
+        )
+
+    client = OpenAI(api_key=OPENAI_API_KEY)
+
+    prompt = f"{history_block}Relevant knowledge excerpts:\n\n{relevant}\n\n---\n\nQuestion: {question}"
+
+    try:
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        answer = response.choices[0].message.content
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Failed to get an answer: {exc}"}), 502
+
+    if user_id:
+        patient_store.save_message(user_id, "user", question)
+        patient_store.save_message(user_id, "assistant", answer)
+        hands_lite.daily(f"answered a signed-in person ({user_id[:8]})")
+        hands_lite.remember_face(f"signed-in {user_id[:8]}", "we spoke (what was said stays in my own store)")
+    elif memory_ctx and memory_ctx["active"]:
+        device_memory.remember_exchange(device_id, memory_ctx["person_name"], question, answer)
+        hands_lite.daily(f"answered {memory_ctx['person_name'] or 'a visitor'}: {question.strip()[:100]}")
+        hands_lite.remember_face(memory_ctx["person_name"] or f"visitor {device_id[:8]}", "we spoke", f"They asked: {question.strip()[:300]}\n\nI answered: {answer.strip()[:600]}")
+
+    return jsonify({"answer": answer, "disclaimer": DISCLAIMER})
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "8422"))
+    app.run(host="0.0.0.0", port=port)

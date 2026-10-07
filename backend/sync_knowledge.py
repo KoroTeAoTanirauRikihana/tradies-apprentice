@@ -11,6 +11,10 @@ across every knowledge document in this project.
 from __future__ import annotations
 
 import re
+import os as _os
+import shutil as _shutil
+import threading as _threading
+import time as _time
 from pathlib import Path
 
 SOURCE = (
@@ -37,7 +41,7 @@ def _filter_verified(text: str) -> str:
     return "\n\n".join(kept)
 
 
-def sync() -> dict:
+def _sync_into_dest() -> dict:
     if not SOURCE.is_dir():
         raise FileNotFoundError(f"Source knowledge folder not found: {SOURCE}")
     DEST.mkdir(parents=True, exist_ok=True)
@@ -59,6 +63,101 @@ def sync() -> dict:
         synced_files += 1
 
     return {"synced_files": synced_files, "dropped_paragraphs": dropped_paragraphs}
+
+
+_SYNC_LOCK = _threading.Lock()
+
+
+def _swap_in(staging: Path, retired: Path, attempts: int = 10) -> None:
+    """Move staging into place as DEST, retrying briefly.
+
+    A directory rename on Windows fails while another thread holds a file
+    inside it open. Reads here are short, so a few retries clear it; if it
+    genuinely cannot swap, the existing knowledge folder is left untouched
+    and working rather than half-replaced.
+    """
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            if DEST.exists():
+                if retired.exists():
+                    retired = retired.with_name(f"{retired.name}.{attempt}")  # never rename onto a name that exists
+                DEST.rename(retired)
+            staging.rename(DEST)
+            return retired
+        except OSError as exc:
+            last_error = exc
+            if retired.exists() and not DEST.exists():
+                retired.rename(DEST)  # put the working copy straight back
+            _time.sleep(0.1 * (attempt + 1))
+    _shutil.rmtree(staging, ignore_errors=True)
+    raise RuntimeError(f"Could not swap the new knowledge folder into place: {last_error}")
+
+
+def sync() -> dict:
+    """Rebuild the local knowledge folder from the vault, atomically.
+
+    Real bug this fixes, found 2026-09-09: the sync used to unlink every
+    knowledge/*.md in place and write the new ones one at a time, while
+    the running app read that same folder. A question arriving inside that
+    window saw a half-built knowledge base - once measured at 81 of 144
+    sections - and nothing said so. A reader now sees the old folder, or
+    the new one, never a partial one.
+
+    The original body is untouched below as _sync_into_dest(); it writes
+    to the module-level DEST, which is pointed at a staging folder here.
+    """
+    with _SYNC_LOCK:
+        return _sync_locked()
+
+
+def _sync_locked() -> dict:
+    global DEST
+    real_dest = DEST
+    # Staging is named for THIS process. These apps often run two processes,
+    # each with its own refresh thread; a shared staging name let one delete
+    # the other's half-written copy and swap the remains into place - measured
+    # live as 64 files where the same sync reported writing 492, with no error
+    # raised, because neither process saw a failure. An in-process lock cannot
+    # fix a collision between processes over one folder on disk. A pid-scoped
+    # name can.
+    _tag = f".new.{_os.getpid()}"
+    staging = real_dest.parent / (real_dest.name + _tag)
+    # 2026-09-15: retired is named per SYNC, not per process. A leftover
+    # knowledge.old.<pid> that rmtree could not fully remove (a reader still
+    # held a file in it) made every later rename in that process fail with
+    # WinError 183 - seen live on the Comorians' and Magyars' apps. Stale
+    # .old.* folders are swept only once they are 10 minutes old, because a
+    # fresh one may belong to another process mid-swap.
+    retired = real_dest.parent / (real_dest.name + f".old.{_os.getpid()}.{int(_time.time() * 1000)}")
+    stale = []
+    for p in real_dest.parent.glob(real_dest.name + ".old.*"):
+        try:
+            if p.is_dir() and _time.time() - p.stat().st_mtime > 600:
+                stale.append(p)
+        except OSError:
+            continue
+    for leftover in [staging, retired] + stale:
+        if leftover.exists():
+            _shutil.rmtree(leftover, ignore_errors=True)
+
+    DEST = staging
+    try:
+        result = _sync_into_dest()
+    except BaseException:
+        DEST = real_dest
+        _shutil.rmtree(staging, ignore_errors=True)
+        raise
+    DEST = real_dest
+
+    if not result.get("synced_files"):
+        # Never swap an empty knowledge base in over a working one.
+        _shutil.rmtree(staging, ignore_errors=True)
+        raise RuntimeError("Refusing to sync: no knowledge files found in the source vault")
+
+    retired = _swap_in(staging, retired) or retired
+    _shutil.rmtree(retired, ignore_errors=True)
+    return result
 
 
 def main() -> None:
