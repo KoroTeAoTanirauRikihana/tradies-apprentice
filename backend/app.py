@@ -60,6 +60,7 @@ DISCLAIMER = (
     "or anything you're not 100% sure is safely isolated, that needs a "
     "licensed professional, not me. Treat what I say as a well-sourced "
     "starting point, never the final word on your own safety."
+    " AI Never War: this apprentice refuses anything related to war, straight out, and is taught to foster and cherish life - the charter, in many languages, is at https://koroai.org/ai-never-war.html"
 )
 
 SYSTEM_PROMPT = f"""
